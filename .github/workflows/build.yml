@@ -1,0 +1,77 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Unpack Android project and include extra repository files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f SVO-main.zip ]; then
+            echo "ERROR: SVO-main.zip was not found in the repository root."
+            exit 1
+          fi
+
+          unzip -o SVO-main.zip -d .
+
+          # Android packages everything under app/src/main/assets, regardless of extension.
+          # Keep relative paths so files with identical names do not overwrite each other.
+          mkdir -p app/src/main/assets/user_files
+          mkdir -p app/src/main/assets/models
+
+          while IFS= read -r -d '' file; do
+            relative="${file#./}"
+
+            # Skip Git metadata, workflow files, the project archive and project sources.
+            case "$relative" in
+              .git/*|.github/*|SVO-main.zip|app/*|build.gradle|settings.gradle|gradle.properties|gradlew|gradlew.bat|gradle/*|README.md)
+                continue
+                ;;
+            esac
+
+            destination="app/src/main/assets/user_files/$relative"
+            mkdir -p "$(dirname "$destination")"
+            cp -f "$file" "$destination"
+            echo "Included asset: $relative"
+
+            # Also place GLB models in the directory used by the game.
+            case "$file" in
+              *.glb|*.GLB)
+                cp -f "$file" "app/src/main/assets/models/$(basename "$file")"
+                ;;
+            esac
+          done < <(find . -type f -print0)
+
+          echo "--- Runtime assets included in APK ---"
+          find app/src/main/assets -type f -printf '%P (%s bytes)\n' | sort
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Build debug APK
+        run: gradle assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: bodycam-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
