@@ -1,0 +1,166 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Unpack Android project and include extra repository files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Выбираем архив проекта: SVO-main.zip, а если его нет - единственный zip в корне
+          ZIP=""
+          if [ -f SVO-main.zip ]; then
+            ZIP="SVO-main.zip"
+          else
+            mapfile -t zips < <(find . -maxdepth 1 -name '*.zip' -printf '%f\n')
+            if [ "${#zips[@]}" -eq 1 ]; then
+              ZIP="${zips[0]}"
+            fi
+          fi
+          if [ -z "$ZIP" ]; then
+            echo "ERROR: project zip (SVO-main.zip) was not found in the repository root."
+            exit 1
+          fi
+          echo "Using archive: $ZIP"
+
+          # Распаковываем в ЧИСТУЮ папку, чтобы старые файлы в корне репозитория не мешали.
+          # unzip возвращает код 1 при предупреждениях (например, кириллица в именах) - это не ошибка.
+          rm -rf _unzipped proj
+          mkdir _unzipped
+          rc=0
+          unzip -q -o "$ZIP" -d _unzipped || rc=$?
+          if [ "$rc" -gt 1 ]; then
+            echo "ERROR: unzip failed with code $rc"
+            exit 1
+          fi
+
+          # Ищем корень Gradle-проекта (там, где settings.gradle и app/build.gradle),
+          # даже если всё лежит внутри вложенной папки архива.
+          PROJECT_ROOT=""
+          while IFS= read -r -d '' s; do
+            d="$(dirname "$s")"
+            if [ -f "$d/app/build.gradle" ] || [ -f "$d/app/build.gradle.kts" ]; then
+              PROJECT_ROOT="$d"
+              break
+            fi
+          done < <(find _unzipped \( -name settings.gradle -o -name settings.gradle.kts \) -print0)
+
+          if [ -z "$PROJECT_ROOT" ]; then
+            echo "ERROR: Gradle project (settings.gradle + app/build.gradle) not found inside $ZIP"
+            echo "--- archive structure ---"
+            find _unzipped -maxdepth 3 | head -50
+            exit 1
+          fi
+          echo "Gradle project root: $PROJECT_ROOT"
+
+          mv "$PROJECT_ROOT" proj
+          rm -rf _unzipped
+
+          # Android кладёт в APK всё из app/src/main/assets.
+          # Сохраняем относительные пути, чтобы одинаковые имена не перезаписывали друг друга.
+          mkdir -p proj/app/src/main/assets/user_files
+          mkdir -p proj/app/src/main/assets/models
+
+          while IFS= read -r -d '' file; do
+            relative="${file#./}"
+
+            # Пропускаем служебные файлы, архив проекта и исходники проекта
+            case "$relative" in
+              .git/*|.github/*|proj/*|_unzipped/*|*.zip|app/*|build.gradle|settings.gradle|gradle.properties|gradlew|gradlew.bat|gradle/*|README.md|.gitignore)
+                continue
+                ;;
+            esac
+
+            destination="proj/app/src/main/assets/user_files/$relative"
+            mkdir -p "$(dirname "$destination")"
+            cp -f "$file" "$destination"
+            echo "Included asset: $relative"
+
+            # GLB-модели дополнительно кладём в папку, которую читает игра
+            case "$file" in
+              *.glb|*.GLB)
+                cp -f "$file" "proj/app/src/main/assets/models/$(basename "$file")"
+                ;;
+            esac
+          done < <(find . -type f -print0)
+
+          echo "--- Runtime assets included in APK ---"
+          find proj/app/src/main/assets -type f -printf '%P (%s bytes)\n' | sort
+
+      - name: Convert FBX animations to GLB
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Игра читает только .glb, поэтому все .fbx (например, анимации с Mixamo) конвертируем здесь.
+          ASSETS="proj/app/src/main/assets/user_files"
+          if [ ! -d "$ASSETS" ]; then echo "No user_files folder"; exit 0; fi
+
+          mapfile -d '' fbx_files < <(find "$ASSETS" -type f -iname '*.fbx' -print0)
+          if [ "${#fbx_files[@]}" -eq 0 ]; then echo "No FBX files to convert"; exit 0; fi
+          echo "FBX files to convert: ${#fbx_files[@]}"
+
+          # Скачиваем конвертер FBX2glTF (основной источник, а если не вышло - запасной)
+          TD="$RUNNER_TEMP/fbx2gltf"
+          mkdir -p "$TD"
+          TOOL=""
+          if curl -fsSL -o "$TD/FBX2glTF" "https://github.com/facebookincubator/FBX2glTF/releases/download/v0.9.7/FBX2glTF-linux-x64"; then
+            chmod +x "$TD/FBX2glTF"
+            TOOL="$TD/FBX2glTF"
+          elif curl -fsSL -o "$TD/tool.zip" "https://github.com/godotengine/FBX2glTF/releases/latest/download/FBX2glTF-linux-x86_64.zip"; then
+            unzip -q -o "$TD/tool.zip" -d "$TD/z" || true
+            TOOL="$(find "$TD/z" -type f -name 'FBX2glTF*' ! -name '*.zip' | head -n 1)"
+            [ -n "$TOOL" ] && chmod +x "$TOOL"
+          fi
+          if [ -z "$TOOL" ] || ! "$TOOL" --help >/dev/null 2>&1; then
+            echo "::warning::FBX2glTF could not be downloaded or started - FBX files stay unconverted"
+            exit 0
+          fi
+
+          ok=0; fail=0
+          for f in "${fbx_files[@]}"; do
+            base="${f%.*}"
+            out="$base"
+            if [ -e "$out.glb" ]; then out="${base}_anim"; fi
+            if "$TOOL" --binary --input "$f" --output "$out" >"$TD/log.txt" 2>&1 && [ -s "$out.glb" ]; then
+              ok=$((ok+1))
+              echo "Converted: ${f#$ASSETS/} -> $(basename "$out.glb")"
+              rm -f "$f"
+            else
+              fail=$((fail+1))
+              echo "::warning::Failed to convert ${f#$ASSETS/}"
+              tail -n 5 "$TD/log.txt" || true
+            fi
+          done
+          echo "FBX converted: $ok, failed: $fail"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Build debug APK
+        working-directory: proj
+        run: gradle assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: bodycam-apk
+          path: proj/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
